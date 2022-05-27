@@ -1,55 +1,35 @@
+@file:OptIn(ExperimentalContracts::class)
+
 package expo.modules.imagepicker
 
 import android.Manifest
-import android.app.Activity
 import android.content.Context
 import android.content.Intent
-import android.graphics.Bitmap
-import android.media.MediaMetadataRetriever
 import android.net.Uri
-import android.provider.MediaStore
-import android.util.Log
-import com.canhub.cropper.CropImage
 import expo.modules.core.errors.ModuleNotFoundException
-import expo.modules.core.utilities.FileUtilities.generateOutputPath
+import android.os.OperationCanceledException
 import expo.modules.core.utilities.ifNull
-import expo.modules.imagepicker.exporters.CompressionImageExporter
-import expo.modules.imagepicker.exporters.CropImageExporter
-import expo.modules.imagepicker.exporters.ImageExporter
-import expo.modules.imagepicker.exporters.RawImageExporter
-import expo.modules.imagepicker.fileproviders.CacheFileProvider
-import expo.modules.imagepicker.fileproviders.CropFileProvider
-import expo.modules.imagepicker.tasks.ImageResultTask
-import expo.modules.imagepicker.tasks.VideoResultTask
+import expo.modules.imagepicker.contracts.CropImageContract
+import expo.modules.imagepicker.contracts.ImagePickerContract
+import expo.modules.imagepicker.contracts.ImagePickerContractResult
 import expo.modules.interfaces.permissions.Permissions
-import expo.modules.interfaces.permissions.PermissionsResponse
-import expo.modules.interfaces.permissions.PermissionsResponseListener
 import expo.modules.interfaces.permissions.PermissionsStatus
 import expo.modules.kotlin.Promise
+import expo.modules.kotlin.functions.Coroutine
 import expo.modules.kotlin.modules.Module
 import expo.modules.kotlin.modules.ModuleDefinition
-import java.io.IOException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.withContext
+import kotlin.contracts.ExperimentalContracts
+import kotlin.contracts.contract
+import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
 
+// TODO(@bbarthec): rename to ExpoImagePicker
 private const val moduleName = "ExponentImagePicker"
 
 class ImagePickerModule : Module() {
-  private val context: Context
-    get() = appContext.reactContext.ifNull { throw IllegalStateException("React Application Context is null. You can't access the Context at this point.") }
-
-  private lateinit var pickerResultStore: PickerResultsStore
-  private var mCameraCaptureURI: Uri? = null
-  private var mPromise: Promise? = null
-  private var mPickerOptions: ImagePickerOptions? = null
-  private var exifDataHandler: ExifDataHandler? = null
-
-  /**
-   * Android system sometimes kills the `MainActivity` after the `ImagePicker` finishes.
-   * Moreover, the react context will be reloaded again in such a case. We need to handle this situation.
-   * To do it we track if the current activity was destroyed.
-   * Flag indicating that the main activity (host) was killed while performing cropping.
-   */
-  private var mWasHostDestroyedWhileCropping = false
-
   override fun definition() = ModuleDefinition {
 
     Name(moduleName)
@@ -72,303 +52,215 @@ class ImagePickerModule : Module() {
       Permissions.getPermissionsWithPermissionsManager(appContext.permissions, promise, Manifest.permission.CAMERA)
     }
 
-    AsyncFunction("launchCameraAsync") { options: ImagePickerOptions, promise: Promise ->
-      val activity = appContext.currentActivity.ifNull {
-        throw MissingCurrentActivityException()
-      }
+    AsyncFunction("launchCameraAsync") Coroutine { options: ImagePickerOptions ->
+      ensureTargetActivityIsAvailable(options)
+      ensureCameraPermissionsAreGranted()
 
-      val permissions = appContext.permissions.ifNull {
-        throw ModuleNotFoundException("permissions")
-      }
+      val mediaFile = createOutputFile(context.cacheDir, options.mediaTypes.toFileExtension())
+      val uri = mediaFile.toContentUri(context)
+      val contract = options.toCameraContract(uri)
 
-      val intentType = if (options.mediaTypes == MediaTypes.VIDEOS) MediaStore.ACTION_VIDEO_CAPTURE else MediaStore.ACTION_IMAGE_CAPTURE
-      val cameraIntent = Intent(intentType)
-      cameraIntent.resolveActivity(activity.application.packageManager).ifNull {
-        throw MissingActivityToHandleIntent(intentType)
-      }
-
-      val permissionsResponseHandler = PermissionsResponseListener { permissionsResponse: Map<String, PermissionsResponse> ->
-        if (permissionsResponse[Manifest.permission.WRITE_EXTERNAL_STORAGE]?.status == PermissionsStatus.GRANTED &&
-          permissionsResponse[Manifest.permission.CAMERA]?.status == PermissionsStatus.GRANTED
-        ) {
-          launchCameraWithPermissionsGranted(promise, cameraIntent, options)
-        } else {
-          promise.reject(UserRejectedPermissionsException())
-        }
-      }
-
-      permissions.askForPermissions(permissionsResponseHandler, Manifest.permission.WRITE_EXTERNAL_STORAGE, Manifest.permission.CAMERA)
+      launchContractWithPromise(contract, options, PickingSource.CAMERA)
     }
 
-    AsyncFunction("launchImageLibraryAsync") { options: ImagePickerOptions, promise: Promise ->
-      val libraryIntent = Intent().apply {
-        when (options.mediaTypes) {
-          MediaTypes.IMAGES -> type = "image/*"
-          MediaTypes.VIDEOS -> type = "video/*"
-          MediaTypes.ALL -> {
-            type = "*/*"
-            putExtra(Intent.EXTRA_MIME_TYPES, arrayOf("image/*", "video/*"))
-          }
-        }
-
-        action = Intent.ACTION_GET_CONTENT
-      }
-
-      startActivityOnResult(libraryIntent, ImagePickerConstants.REQUEST_LAUNCH_IMAGE_LIBRARY, promise, options)
+    AsyncFunction("launchImageLibraryAsync") Coroutine { options: ImagePickerOptions ->
+      val contract = options.toImageLibraryContract()
+      launchContractWithPromise(contract, options, PickingSource.IMAGE_LIBRARY)
     }
 
-    AsyncFunction("getPendingResultAsync") { promise: Promise ->
-      promise.resolve(pickerResultStore.getAllPendingResults())
-    }
+    AsyncFunction("getPendingResultAsync") Coroutine { _: Promise -> // TODO (@bbarthec): without parameter there's an error: "Overload resolution ambiguity. All these functions match. <lists all Coroutine functions>"
+      val (bareResult, options) = pendingMediaPickingResult.ifNull {
+        return@Coroutine null
+      }.also { pendingMediaPickingResult = null }
 
-    // endregion
-
-    // region Module and Activity lifecycles
-
-    OnCreate {
-      pickerResultStore = PickerResultsStore(context)
-    }
-
-    OnActivityDestroys {
-      mWasHostDestroyedWhileCropping = true
-    }
-
-    OnActivityEntersForeground {
-      mWasHostDestroyedWhileCropping = false
-    }
-
-    OnActivityResult { activity, (requestCode, resultCode, data) ->
-      if (shouldHandleOnActivityResult(activity, requestCode)) {
-        var pickerOptions = mPickerOptions!!
-        val promise = if (mWasHostDestroyedWhileCropping && mPromise !is PendingPromise) {
-          if (pickerOptions.base64) {
-            // we know that the activity was killed and we don't want to store
-            // base64 into `SharedPreferences`...
-            pickerOptions = ImagePickerOptions().apply {
-              quality = pickerOptions.quality
-              allowsEditing = pickerOptions.allowsEditing
-              aspect = pickerOptions.aspect
-              base64 = false
-              mediaTypes = pickerOptions.mediaTypes
-              exif = pickerOptions.exif
-              videoMaxDuration = pickerOptions.videoMaxDuration
-            }
-            // ...but we need to remember to add it later.
-            PendingPromise(pickerResultStore, isBase64 = true)
-          } else {
-            PendingPromise(pickerResultStore)
-          }
-        } else {
-          mPromise!!
-        }
-
-        mPromise = null
-        mPickerOptions = null
-
-        handleOnActivityResult(promise, activity, requestCode, resultCode, data, pickerOptions)
-      }
+      mediaHandler.readExtras(bareResult, options)
     }
 
     // endregion
   }
 
-  // endregion
+  // TODO (@bbarthec): generalize it as almost every module re-declares this approach
+  val context: Context
+    get() = requireNotNull(appContext.reactContext) { "React Application Context is null" }
 
-  // region helpers
-
-  private fun getMediaLibraryPermissions(writeOnly: Boolean): Array<String> =
-    if (writeOnly) arrayOf(Manifest.permission.WRITE_EXTERNAL_STORAGE)
-    else arrayOf(Manifest.permission.WRITE_EXTERNAL_STORAGE, Manifest.permission.READ_EXTERNAL_STORAGE)
-
-  private fun launchCameraWithPermissionsGranted(promise: Promise, cameraIntent: Intent, pickerOptions: ImagePickerOptions) {
-    val imageFile = createOutputFile(
-      context.cacheDir,
-      if (pickerOptions.mediaTypes == MediaTypes.VIDEOS) ".mp4" else ".jpg"
-    ).ifNull {
-      return promise.reject(FailedToCreateFileException())
+  private val currentActivity
+    get() = appContext.activityProvider?.currentActivity.ifNull {
+      throw MissingCurrentActivityException()
     }
 
-    mCameraCaptureURI = uriFromFile(imageFile)
+  private val mediaHandler = MediaHandler(this)
 
-    val activity = appContext.currentActivity.ifNull {
-      return promise.reject(MissingCurrentActivityException())
+  /**
+   * Stores result for an operation that has been interrupted by the activity destruction.
+   * The results are stored only for successful, non-cancelled-by-user scenario.
+   * Each new picking operation overrides previous state (for cancelled operation `null` is set).
+   * The user can retrieve the data using exported `getPendingResultAsync` method.
+   */
+  private var pendingMediaPickingResult: PendingMediaPickingResult? = null
+
+  /**
+   * Calls [launchPicker] and unifies flow shared between "launchCameraAsync" and "launchImageLibraryAsync"
+   */
+  private suspend fun launchContractWithPromise(
+    contract: ImagePickerContract,
+    options: ImagePickerOptions,
+    pickingSource: PickingSource,
+  ): Any? {
+    try {
+      val bareResult = launchPicker(contract, options, pickingSource)
+      return mediaHandler.readExtras(bareResult, options)
+    } catch (cause: OperationCanceledException) {
+      return ImagePickerCancelledResponse()
+    } catch (cause: ActivityDestroyedException) {
+      pendingMediaPickingResult = cause.data?.let { PendingMediaPickingResult(it, options) }
     }
-
-    mPromise = promise
-    mPickerOptions = pickerOptions
-
-    if (pickerOptions.videoMaxDuration > 0) {
-      cameraIntent.putExtra(MediaStore.EXTRA_DURATION_LIMIT, pickerOptions.videoMaxDuration)
-    }
-
-    // camera intent needs a content URI but we need a file one
-    cameraIntent.putExtra(MediaStore.EXTRA_OUTPUT, contentUriFromFile(imageFile, activity.application))
-    startActivityOnResult(cameraIntent, ImagePickerConstants.REQUEST_LAUNCH_CAMERA, promise, pickerOptions)
+    return null
   }
 
   /**
-   * Starts the crop intent.
+   * Launches picker (image library or camera) and possibly edit the picked assets.
+   * There are two flows that might happen depending on fact whether launching Activity is still alive:
+   *   1. launching Activity is alive -> all the media assets are processed (possibly edited) unless
+   *      a user cancels any operation (picking or editing) at any point of time.
+   *      If cancellation happens then the whole operation (even for multiple assets) is cancelled.
+   *   2. launching Activity is destroyed -> the operation proceeds to the end and picked
+   *      (and possibly edited) assets are preserved in [pendingMediaPickingResult] to be retrieved later
+   *      unless any single operation is cancelled, because then nothing is preserved.
    *
-   * @param promise Promise which will be rejected if something goes wrong
-   * @param uri Uri to file which will be cropped
-   * @param type Media type of source file
-   * @param needGenerateFile Tells if generating a new file is needed
-   * @param pickerOptions Additional options
+   * TODO(@bbarthec): Right now I'm launching this using [Dispatchers.Main] to properly call [UiThread]/[MainThread] underlying functions
+   *                  I need to find out what's our intentional way to dispatch some code on UI/Main Thread using coroutines
    */
-  private fun startCropIntent(promise: Promise, uri: Uri, type: String, needGenerateFile: Boolean, pickerOptions: ImagePickerOptions) {
-    var extension = ".jpg"
-    var compressFormat = Bitmap.CompressFormat.JPEG
-    // if the image is created by camera intent we don't need a new path - it's been already saved
-    when {
-      type.contains("png") -> {
-        compressFormat = Bitmap.CompressFormat.PNG
-        extension = ".png"
+  private suspend fun launchPicker(
+    contract: ImagePickerContract,
+    options: ImagePickerOptions,
+    pickingSource: PickingSource
+  ): Pair<MediaType, Uri> = withContext(Dispatchers.Main) {
+    val (rawPickingResult, activityDestroyedWhenPicking) = appContext.launchForActivityResult(contract)
+
+    // Keep track of possible Activity destruction since the bare picking operation
+    var activityDestroyed = activityDestroyedWhenPicking
+
+    /**
+     * Picking cancelled:
+     * - signal Activity destruction with no data to be preserved
+     * - or signal cancellation
+     */
+    checkOperationCancelled(activityDestroyed, rawPickingResult)
+
+    /**
+     * Editing not required:
+     * - signal Activity destruction with picked media assets
+     * - or return picked media assets
+     */
+    if (!options.allowsEditing) {
+      if (activityDestroyed) {
+        throw ActivityDestroyedException(rawPickingResult.data)
       }
-      type.contains("gif") -> {
-        // If we allow editing, the result image won't ever be a GIF as the cropper doesn't support it.
-        // Let's convert to PNG in such case.
-        extension = ".png"
-        compressFormat = Bitmap.CompressFormat.PNG
-      }
-      type.contains("bmp") -> {
-        // If we allow editing, the result image won't ever be a BMP as the cropper doesn't support it.
-        // Let's convert to PNG in such case.
-        extension = ".png"
-        compressFormat = Bitmap.CompressFormat.PNG
-      }
-      !type.contains("jpeg") -> {
-        Log.w(ImagePickerConstants.TAG, "Image type not supported. Falling back to JPEG instead.")
-        extension = ".jpg"
-      }
+      return@withContext rawPickingResult.data
     }
 
-    val fileUri: Uri = try {
-      if (needGenerateFile) {
-        uriFromFilePath(generateOutputPath(context.cacheDir, ImagePickerConstants.CACHE_DIR_NAME, extension))
-      } else {
-        uri
-      }
-    } catch (e: IOException) {
-      return promise.reject(CroppingFailedException(e))
+    /**
+     * Editing required
+     */
+    if (rawPickingResult.data.first == MediaType.VIDEO) {
+      // We do not edit video assets
+      return@withContext rawPickingResult.data
     }
 
-    val cropImageBuilder = CropImage.activity(uri).apply {
-      pickerOptions.aspect?.let { (x, y) ->
-        setAspectRatio((x as Number).toInt(), (y as Number).toInt())
-        setFixAspectRatio(true)
-        setInitialCropWindowPaddingRatio(0f)
-      }
+    val (editedResult, activityDestroyedWhenEditing) = appContext.launchForActivityResult(CropImageContract(
+      rawPickingResult.data.second,
+      options,
+      pickingSource
+    ))
+    activityDestroyed = activityDestroyed && activityDestroyedWhenEditing
 
-      setOutputUri(fileUri)
-      setOutputCompressFormat(compressFormat)
-      setOutputCompressQuality((pickerOptions.quality * 100).toInt())
+    /**
+     * Editing cancelled:
+     * - signal Activity destruction with no data to be preserved
+     * - or signal cancellation
+     */
+    checkOperationCancelled(activityDestroyed, editedResult)
+
+    /**
+     * Editing succeeded:
+     * - signal Activity destruction with edited image
+     * - or simply return edited image
+     */
+    if (activityDestroyed) {
+      throw ActivityDestroyedException(editedResult.data)
     }
-    exifDataHandler = ExifDataHandler(uri)
-    startActivityOnResult(cropImageBuilder.getIntent(context), CropImage.CROP_IMAGE_ACTIVITY_REQUEST_CODE, promise, pickerOptions)
+    editedResult.data
+  }
+
+  /**
+   * If [operationResult] is [ImagePickerContractResult.Cancelled] then this function would throw
+   * @throws [ActivityDestroyedException]
+   * @throws [OperationCanceledException]
+   */
+  private fun checkOperationCancelled(activityDestroyed: Boolean, operationResult: ImagePickerContractResult) {
+    contract {
+      returns() implies (operationResult is ImagePickerContractResult.Success)
+    }
+    if (activityDestroyed) {
+      throw ActivityDestroyedException(null)
+    }
+    throw OperationCanceledException()
   }
 
   // endregion
 
-  // region activity for result
+  // region Utils
 
-  private fun startActivityOnResult(intent: Intent, requestCode: Int, promise: Promise, pickerOptions: ImagePickerOptions) {
-    appContext.currentActivity
-      .ifNull {
-        return promise.reject(MissingCurrentActivityException())
-      }
-      .also {
-        mPromise = promise
-        mPickerOptions = pickerOptions
-      }
-      .startActivityForResult(intent, requestCode)
+  private fun getMediaLibraryPermissions(writeOnly: Boolean): Array<String> {
+    return if (writeOnly) {
+      arrayOf(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+    } else {
+      arrayOf(Manifest.permission.WRITE_EXTERNAL_STORAGE, Manifest.permission.READ_EXTERNAL_STORAGE)
+    }
   }
 
-  private fun shouldHandleOnActivityResult(activity: Activity, requestCode: Int): Boolean {
-    return appContext.currentActivity != null &&
-      mPromise != null &&
-      mPickerOptions != null &&
-      // When we launched the crop tool and the android kills current activity, the references can be different.
-      // So, we fallback to the requestCode in this case.
-      (activity === appContext.currentActivity || mWasHostDestroyedWhileCropping && requestCode == CropImage.CROP_IMAGE_ACTIVITY_REQUEST_CODE)
+  private fun ensureTargetActivityIsAvailable(options: ImagePickerOptions) {
+    val cameraIntent = Intent(options.mediaTypes.toCameraIntentAction())
+    if (cameraIntent.resolveActivity(currentActivity.application.packageManager) == null) {
+      throw MissingActivityToHandleIntent(cameraIntent.type)
+    }
   }
 
-  private fun handleOnActivityResult(promise: Promise, activity: Activity, requestCode: Int, resultCode: Int, intent: Intent?, pickerOptions: ImagePickerOptions) {
-    if (resultCode != Activity.RESULT_OK) {
-      return promise.resolve(ImagePickerCancelledResponse())
+  private suspend fun ensureCameraPermissionsAreGranted(): Unit = suspendCancellableCoroutine { continuation ->
+    val permissions = appContext.permissions.ifNull {
+      throw ModuleNotFoundException("Permissions")
     }
 
-    val contentResolver = activity.application.contentResolver
-
-    if (requestCode == CropImage.CROP_IMAGE_ACTIVITY_REQUEST_CODE) {
-      val result = CropImage.getActivityResult(intent).ifNull {
-        return promise.reject(CroppingFailedException())
-      }
-
-      val exporter = CropImageExporter(result.rotation, result.cropRect, pickerOptions.base64)
-      ImageResultTask(
-        promise,
-        result.uri,
-        contentResolver,
-        CropFileProvider(result.uri),
-        pickerOptions.allowsEditing,
-        pickerOptions.exif,
-        exporter,
-        exifDataHandler,
-        coroutineScope
-      ).execute()
-      return
-    }
-
-    val uri = (if (requestCode == ImagePickerConstants.REQUEST_LAUNCH_CAMERA) mCameraCaptureURI else intent?.data)
-      .ifNull {
-        return promise.reject(FailedToReadDataException())
-      }
-
-    val type = getType(contentResolver, uri).ifNull {
-      return promise.reject(FailedToDeduceTypeException())
-    }
-
-    if (type.contains("image")) {
-      if (pickerOptions.allowsEditing) {
-        // if the image is created by camera intent we don't need a new file - it's been already saved
-        val needGenerateFile = requestCode != ImagePickerConstants.REQUEST_LAUNCH_CAMERA
-        startCropIntent(promise, uri, type, needGenerateFile, pickerOptions)
-        return
-      }
-
-      val exporter: ImageExporter = if (pickerOptions.quality == ImagePickerConstants.MAXIMUM_QUALITY) {
-        RawImageExporter(contentResolver, pickerOptions.base64)
+    permissions.askForPermissions({ permissionsResponse ->
+      if (
+        permissionsResponse[Manifest.permission.WRITE_EXTERNAL_STORAGE]?.status == PermissionsStatus.GRANTED
+        && permissionsResponse[Manifest.permission.CAMERA]?.status == PermissionsStatus.GRANTED
+      ) {
+        continuation.resume(Unit)
       } else {
-        val imageLoader = appContext.imageLoader.ifNull {
-          return promise.reject(MissingModuleException("ImageLoader"))
-        }
-        CompressionImageExporter(imageLoader, pickerOptions.quality, pickerOptions.base64)
+        continuation.resumeWithException(UserRejectedPermissionsException())
       }
-
-      ImageResultTask(
-        promise,
-        uri,
-        contentResolver,
-        CacheFileProvider(context.cacheDir, deduceExtension(type)),
-        pickerOptions.allowsEditing,
-        pickerOptions.exif,
-        exporter,
-        exifDataHandler,
-        coroutineScope
-      ).execute()
-      return
-    }
-
-    try {
-      val metadataRetriever = MediaMetadataRetriever().apply {
-        setDataSource(context, uri)
-      }
-      VideoResultTask(promise, uri, contentResolver, CacheFileProvider(context.cacheDir, ".mp4"), metadataRetriever, coroutineScope).execute()
-    } catch (e: RuntimeException) {
-      promise.reject(FailedToExtractVideoMetadataException(e))
-      return
-    }
+    }, Manifest.permission.WRITE_EXTERNAL_STORAGE, Manifest.permission.CAMERA)
   }
 
   // endregion
 }
+
+internal enum class PickingSource {
+  CAMERA,
+  IMAGE_LIBRARY
+}
+
+/**
+ * Signalling [Exception] that might holds the optional data that should be preserved for later retrieval.
+ * @see [ImagePickerModule.pendingMediaPickingResult]
+ */
+internal class ActivityDestroyedException(val data: Pair<MediaType, Uri>?): Exception()
+
+/**
+ * Simple data structure to hold the data that has to be preserved after the Activity is destroyed.
+ */
+internal data class PendingMediaPickingResult(
+  val data: Pair<MediaType, Uri>,
+  val options: ImagePickerOptions
+)
