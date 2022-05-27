@@ -9,7 +9,12 @@ void JavaScriptObject::registerNatives() {
   registerHybrid({
                    makeNativeMethod("hasProperty", JavaScriptObject::jniHasProperty),
                    makeNativeMethod("getProperty", JavaScriptObject::jniGetProperty),
-                   makeNativeMethod("getPropertyNames", JavaScriptObject::jniGetPropertyNames)
+                   makeNativeMethod("getPropertyNames", JavaScriptObject::jniGetPropertyNames),
+                   makeNativeMethod("setBoolProperty", JavaScriptObject::setBoolProperty),
+                   makeNativeMethod("setDoubleProperty", JavaScriptObject::setDoubleProperty),
+                   makeNativeMethod("setStringProperty", JavaScriptObject::setStringProperty),
+                   makeNativeMethod("setJSValueProperty", JavaScriptObject::setJSValueProperty),
+                   makeNativeMethod("setJSObjectProperty", JavaScriptObject::setJSObjectProperty),
                  });
 }
 
@@ -18,6 +23,10 @@ JavaScriptObject::JavaScriptObject(
   std::shared_ptr<jsi::Object> jsObject
 ) : runtimeHolder(std::move(runtime)), jsObject(std::move(jsObject)) {
   assert(runtimeHolder.lock() != nullptr);
+}
+
+std::shared_ptr<jsi::Object> JavaScriptObject::get() {
+  return jsObject;
 }
 
 bool JavaScriptObject::hasProperty(const std::string &name) {
@@ -70,5 +79,73 @@ jni::local_ref<jni::JArrayClass<jstring>> JavaScriptObject::jniGetPropertyNames(
   }
 
   return paredResult;
+}
+
+void JavaScriptObject::setProperty(const std::string &name, jsi::Value value) {
+  auto runtime = runtimeHolder.lock();
+  assert(runtime != nullptr);
+  jsObject->setProperty(*runtime->get(), name.c_str(), value);
+}
+
+void JavaScriptObject::setBoolProperty(jni::alias_ref<jstring> name, bool value) {
+  auto runtime = runtimeHolder.lock();
+  assert(runtime != nullptr);
+  auto cName = name->toStdString();
+  jsObject->setProperty(*runtime->get(), cName.c_str(), value);
+}
+
+void JavaScriptObject::setDoubleProperty(jni::alias_ref<jstring> name, double value) {
+  auto runtime = runtimeHolder.lock();
+  assert(runtime != nullptr);
+  auto cName = name->toStdString();
+  jsObject->setProperty(*runtime->get(), cName.c_str(), value);
+}
+
+void JavaScriptObject::setStringProperty(
+  jni::alias_ref<jstring> name,
+  jni::alias_ref<jstring> value
+) {
+  auto runtime = runtimeHolder.lock();
+  assert(runtime != nullptr);
+  auto cName = name->toStdString();
+  jsObject->setProperty(
+    *runtime->get(),
+    cName.c_str(),
+    jsi::String::createFromUtf8(*runtime->get(), value->toStdString())
+  );
+}
+
+void JavaScriptObject::setJSValueProperty(
+  jni::alias_ref<jstring> name,
+  jni::alias_ref<JavaScriptValue::javaobject> value
+) {
+  auto runtime = runtimeHolder.lock();
+  assert(runtime != nullptr);
+  auto cName = name->toStdString();
+  jsObject->setProperty(
+    *runtime->get(),
+    cName.c_str(),
+    jsi::Value(
+      *runtime->get(),
+      *value->cthis()->get()
+    )
+  );
+}
+
+void JavaScriptObject::setJSObjectProperty(
+  jni::alias_ref<jstring> name,
+  jni::alias_ref<JavaScriptObject::javaobject> value
+) {
+  auto runtime = runtimeHolder.lock();
+  assert(runtime != nullptr);
+  auto cName = name->toStdString();
+  jsObject->setProperty(
+    *runtime->get(),
+    cName.c_str(),
+    jsi::Value(
+      *runtime->get(),
+      *value->cthis()->get()
+    )
+  );
 }
 } // namespace expo

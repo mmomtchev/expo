@@ -31,6 +31,8 @@ public:
     std::shared_ptr<jsi::Object> jsObject
   );
 
+  std::shared_ptr<jsi::Object> get();
+
   /**
    * @return a bool whether the object has a property with the given name
    */
@@ -47,6 +49,8 @@ public:
    */
   std::vector<std::string> getPropertyNames();
 
+  void setProperty(const std::string &name, jsi::Value value);
+
 private:
   friend HybridBase;
   std::weak_ptr<JavaScriptRuntime> runtimeHolder;
@@ -59,5 +63,21 @@ private:
   );
 
   jni::local_ref<jni::JArrayClass<jstring>> jniGetPropertyNames();
+
+  void setDoubleProperty(jni::alias_ref<jstring> name, double value);
+
+  void setBoolProperty(jni::alias_ref<jstring> name, bool value);
+
+  void setStringProperty(jni::alias_ref<jstring> name, jni::alias_ref<jstring> value);
+
+  void setJSValueProperty(
+    jni::alias_ref<jstring> name,
+    jni::alias_ref<jni::HybridClass<JavaScriptValue>::javaobject> value
+  );
+
+  void setJSObjectProperty(
+    jni::alias_ref<jstring> name,
+    jni::alias_ref<jni::HybridClass<JavaScriptObject>::javaobject> value
+  );
 };
 } // namespace expo

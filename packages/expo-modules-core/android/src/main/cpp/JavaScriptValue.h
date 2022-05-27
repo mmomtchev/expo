@@ -31,6 +31,9 @@ public:
     std::shared_ptr<jsi::Value> jsValue
   );
 
+  std::shared_ptr<jsi::Value> get();
+
+
   std::string kind();
 
   bool isNull();
